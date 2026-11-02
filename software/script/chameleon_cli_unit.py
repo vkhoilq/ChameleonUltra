@@ -32,6 +32,7 @@ from chameleon_utils import (
     print_key_table,
     odd_parity_byte,
     default_cwd,
+    mf1_sector_block_range,
 )
 
 from chameleon_utils import CLITree
@@ -69,6 +70,81 @@ type_id_SAK_dict = {
     0x28: "SmartMX with MIFARE Classic 1K",
     0x38: "SmartMX with MIFARE Classic 4K",
 }
+
+
+# SAK -> (size name, sector count) for MIFARE Classic
+MF1_SAK_SECTORS = {
+    b"\x01": ("1k", 16),
+    b"\x08": ("1k", 16),
+    b"\x09": ("mini", 5),
+    b"\x10": ("2k", 32),
+    b"\x18": ("4k", 40),
+}
+
+
+def detect_mf1_max_sectors(cmd):
+    """
+    Determine how many sectors a MIFARE Classic card has by reading its SAK.
+    Falls back to 16 (1K) when the tag cannot be identified.
+    """
+    try:
+        resp = cmd.hf14a_scan()
+    except UnexpectedResponseError:
+        resp = None
+    if resp:
+        for data_tag in resp:
+            sak = data_tag.get("sak")
+            if sak:
+                name, sectors = MF1_SAK_SECTORS.get(bytes(sak), ("1k", 16))
+                print(
+                    f" {CG}[+]{C0}  Detected MIFARE Classic {CY}{name}{C0}"
+                    f" ({sectors} sectors)"
+                )
+                return sectors
+    print(
+        f" {CR}[!]{C0}  Could not detect card size, assuming 1K"
+        f" (16 sectors). Use --4k to force."
+    )
+    return 16
+
+
+def find_mf1_sector_keys(cmd, keys, first_block, block_count):
+    """
+    Find which of the given keys authenticate a MIFARE Classic sector.
+
+    Probes the sector trailer first, since that is the block the keys
+    actually belong to and reading it does not depend on the sector
+    access bits. Falls back to the first data block if the trailer
+    probe finds nothing.
+
+    Returns (type_a, key_a, type_b, key_b). Either key may be None
+    when no key in the list authenticates with that key type.
+    """
+    trailer_block = first_block + block_count - 1
+
+    for probe_block in (trailer_block, first_block):
+        type_a = type_b = None
+        key_a = key_b = None
+        for key in keys:
+            if type_b is None:
+                try:
+                    cmd.mf1_read_one_block(probe_block, MfcKeyType.B, key)
+                    type_b = MfcKeyType.B
+                    key_b = key
+                except UnexpectedResponseError:
+                    pass
+            if type_a is None:
+                try:
+                    cmd.mf1_read_one_block(probe_block, MfcKeyType.A, key)
+                    type_a = MfcKeyType.A
+                    key_a = key
+                except UnexpectedResponseError:
+                    pass
+            if type_a is not None and type_b is not None:
+                break
+        if type_a is not None or type_b is not None:
+            return type_a, key_a, type_b, key_b
+    return None, None, None, None
 
 
 def load_key_file(import_key, keys):
@@ -2406,16 +2482,9 @@ class HFMFAutopwn(ReaderRequiredUnit):
         return parser
 
     def get_mf_size(self, sak):
-        sizes = {
-            b"\x18": ("4k", 40),
-            b"\x08": ("1k", 16),
-            b"\x09": ("mini", 5),
-            b"\x10": ("2k", 32),
-            b"\x01": ("1k", 16),
-        }
-        if sak not in sizes:
+        if sak not in MF1_SAK_SECTORS:
             print("Unknown SAK, defaulting to 16 sectors")
-        return sizes.get(sak, ("1k", 16))
+        return MF1_SAK_SECTORS.get(sak, ("1k", 16))
 
     def getsak(self, deep=False):
         return self.scan(deep, "sak")
@@ -3123,24 +3192,29 @@ class HFMFView(MF1AuthArgsUnit):
                 raise ArgsParserError(
                     f"Invalid key file. Found {len(keys)}, expected {args.maxSectors}"
                 )
-            # iterate over blocks
-            for blk in range(0, args.maxSectors * 4):
-                resp = None
-                try:
-                    # first try with key B
-                    resp = self.cmd.mf1_read_one_block(
-                        blk, MfcKeyType.B, keys[blk // 4][1]
-                    )
-                except UnexpectedResponseError:
-                    # ignore read errors at this stage as we want to try key A
-                    pass
-                if not resp:
-                    # try with key A if B was unsuccessful
-                    # this will raise an exception if key A fails too
-                    resp = self.cmd.mf1_read_one_block(
-                        blk, MfcKeyType.A, keys[blk // 4][0]
-                    )
-                data.extend(resp)
+            # iterate over sectors and their blocks.
+            # 4K cards have 16-block sectors above sector 31, so the block
+            # count per sector is not a constant.
+            for s in range(args.maxSectors):
+                first_block, block_count = mf1_sector_block_range(s)
+                key_a, key_b = keys[s]
+                for blk in range(first_block, first_block + block_count):
+                    resp = None
+                    try:
+                        # first try with key B
+                        resp = self.cmd.mf1_read_one_block(
+                            blk, MfcKeyType.B, key_b
+                        )
+                    except UnexpectedResponseError:
+                        # ignore read errors at this stage as we want to try key A
+                        pass
+                    if not resp:
+                        # try with key A if B was unsuccessful
+                        # this will raise an exception if key A fails too
+                        resp = self.cmd.mf1_read_one_block(
+                            blk, MfcKeyType.A, key_a
+                        )
+                    data.extend(resp)
         else:
             raise ArgsParserError(
                 "Missing args. Specify --dump-file (-d) or --key-file (-k)"
@@ -3175,6 +3249,37 @@ class HFMFDump(MF1AuthArgsUnit):
             required=True,
             help="Read keys (to communicate with tag to dump) from .dic format file",
         )
+        mifare_type_group = parser.add_mutually_exclusive_group()
+        mifare_type_group.add_argument(
+            "--mini",
+            help="MIFARE Classic Mini / S20",
+            action="store_const",
+            dest="maxSectors",
+            const=5,
+        )
+        mifare_type_group.add_argument(
+            "--1k",
+            help="MIFARE Classic 1k / S50",
+            action="store_const",
+            dest="maxSectors",
+            const=16,
+        )
+        mifare_type_group.add_argument(
+            "--2k",
+            help="MIFARE Classic/Plus 2k",
+            action="store_const",
+            dest="maxSectors",
+            const=32,
+        )
+        mifare_type_group.add_argument(
+            "--4k",
+            help="MIFARE Classic 4k / S70",
+            action="store_const",
+            dest="maxSectors",
+            const=40,
+        )
+        # None means "detect the card size from its SAK"
+        parser.set_defaults(maxSectors=None)
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -3192,27 +3297,54 @@ class HFMFDump(MF1AuthArgsUnit):
             content_type = args.dump_file_type
 
         # read keys from file
-        keys = [bytes.fromhex(line[:-1]) for line in args.dic.readlines()]
+        keys = []
+        for line in args.dic.readlines():
+            line = line.strip()
+            if line:
+                keys.append(bytes.fromhex(line))
 
-        # data to write from dump file
-        buffer = bytearray()
+        # number of sectors to dump: explicit flag wins, otherwise detect from SAK
+        max_sectors = args.maxSectors
+        if max_sectors is None:
+            max_sectors = self.detect_max_sectors()
+
+        def write(data: bytes):
+            if content_type == "bin":
+                args.dump_file.write(data)
+            else:
+                args.dump_file.write(data.hex().encode("utf-8"))
+            # flush per block so a later failure does not discard the dump
+            args.dump_file.flush()
+
+        unreadable = []
 
         # iterate over sectors
-        for s in range(16):
-            # find working keys for this sector (both A and B)
+        for s in range(max_sectors):
+            # 4K cards have 16-block sectors above sector 31
+            first_block, block_count = mf1_sector_block_range(s)
+            trailer_block = first_block + block_count - 1
+
+            # find working keys for this sector (both A and B).
+            # Probe the trailer block: it is the block the key actually belongs
+            # to, and reading it does not depend on the sector access bits.
             type_a = type_b = None
             key_a = key_b = None
+            trailer_data = None
             for key in keys:
                 if type_b is None:
                     try:
-                        self.cmd.mf1_read_one_block(4 * s, MfcKeyType.B, key)
+                        trailer_data = self.cmd.mf1_read_one_block(
+                            trailer_block, MfcKeyType.B, key
+                        )
                         type_b = MfcKeyType.B
                         key_b = key
                     except UnexpectedResponseError:
                         pass
                 if type_a is None:
                     try:
-                        self.cmd.mf1_read_one_block(4 * s, MfcKeyType.A, key)
+                        trailer_data = self.cmd.mf1_read_one_block(
+                            trailer_block, MfcKeyType.A, key
+                        )
                         type_a = MfcKeyType.A
                         key_a = key
                     except UnexpectedResponseError:
@@ -3220,31 +3352,83 @@ class HFMFDump(MF1AuthArgsUnit):
                 if type_a is not None and type_b is not None:
                     break
             if type_a is None and type_b is None:
+                # fallback: probe the first data block like older versions did
+                for key in keys:
+                    if type_b is None:
+                        try:
+                            self.cmd.mf1_read_one_block(
+                                first_block, MfcKeyType.B, key
+                            )
+                            type_b = MfcKeyType.B
+                            key_b = key
+                        except UnexpectedResponseError:
+                            pass
+                    if type_a is None:
+                        try:
+                            self.cmd.mf1_read_one_block(
+                                first_block, MfcKeyType.A, key
+                            )
+                            type_a = MfcKeyType.A
+                            key_a = key
+                        except UnexpectedResponseError:
+                            pass
+                    if type_a is not None and type_b is not None:
+                        break
+            if type_a is None and type_b is None:
                 raise Exception(f"No key found for sector {s}")
 
-            typ = type_a if type_a is not None else type_b
-            key = key_a if type_a is not None else key_b
-            # iterate over blocks
-            for b in range(3):
-                block_data = self.cmd.mf1_read_one_block(4 * s + b, typ, key)
-                if content_type == "bin":
-                    buffer.extend(block_data)
-                elif content_type == "hex":
-                    buffer.extend(block_data.hex().encode("utf-8"))
+            # iterate over data blocks, trying every known key type
+            for b in range(block_count - 1):
+                block_num = first_block + b
+                block_data = None
+                for typ, k in ((type_a, key_a), (type_b, key_b)):
+                    if typ is None:
+                        continue
+                    try:
+                        block_data = self.cmd.mf1_read_one_block(block_num, typ, k)
+                        break
+                    except UnexpectedResponseError:
+                        continue
+                if block_data is None:
+                    print(
+                        f" {CR}[!]{C0}  Block {block_num} unreadable,"
+                        f" filling with zeros"
+                    )
+                    unreadable.append(block_num)
+                    block_data = bytes(16)
+                write(block_data)
 
             # sector trailer: fill key bytes from known keys
-            trailer = bytearray(self.cmd.mf1_read_one_block(4 * s + 3, typ, key))
+            if trailer_data is None:
+                for typ, k in ((type_a, key_a), (type_b, key_b)):
+                    if typ is None:
+                        continue
+                    try:
+                        trailer_data = self.cmd.mf1_read_one_block(
+                            trailer_block, typ, k
+                        )
+                        break
+                    except UnexpectedResponseError:
+                        continue
+            trailer = bytearray(trailer_data if trailer_data else bytes(16))
             if key_a is not None:
                 trailer[0:6] = key_a
             if key_b is not None:
                 trailer[10:16] = key_b
-            trailer = bytes(trailer)
-            if content_type == "bin":
-                buffer.extend(trailer)
-            elif content_type == "hex":
-                buffer.extend(trailer.hex().encode("utf-8"))
-        # write buffer to file
-        args.dump_file.write(buffer)
+            write(bytes(trailer))
+
+        if unreadable:
+            print(
+                f" {CR}[!]{C0}  {len(unreadable)} block(s) unreadable,"
+                f" filled with zeros"
+            )
+
+    def detect_max_sectors(self):
+        """
+        Determine how many sectors the card has by reading its SAK.
+        Falls back to 16 (1K) when the tag cannot be identified.
+        """
+        return detect_mf1_max_sectors(self.cmd)
 
 
 @hf_mf.command("clone")
@@ -3281,6 +3465,37 @@ class HFMFClone(MF1AuthArgsUnit):
             required=True,
             help="Read keys (to communicate with tag to write) from .dic format file",
         )
+        mifare_type_group = parser.add_mutually_exclusive_group()
+        mifare_type_group.add_argument(
+            "--mini",
+            help="MIFARE Classic Mini / S20",
+            action="store_const",
+            dest="maxSectors",
+            const=5,
+        )
+        mifare_type_group.add_argument(
+            "--1k",
+            help="MIFARE Classic 1k / S50",
+            action="store_const",
+            dest="maxSectors",
+            const=16,
+        )
+        mifare_type_group.add_argument(
+            "--2k",
+            help="MIFARE Classic/Plus 2k",
+            action="store_const",
+            dest="maxSectors",
+            const=32,
+        )
+        mifare_type_group.add_argument(
+            "--4k",
+            help="MIFARE Classic 4k / S70",
+            action="store_const",
+            dest="maxSectors",
+            const=40,
+        )
+        # None means "detect the card size from its SAK"
+        parser.set_defaults(maxSectors=None)
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -3304,58 +3519,81 @@ class HFMFClone(MF1AuthArgsUnit):
             buffer.extend(bytearray.fromhex(args.dump_file.read().decode()))
         if len(buffer) % 16 != 0:
             raise Exception("Data block not align for 16 bytes")
-        if len(buffer) / 16 > 256:
-            raise Exception("Data block memory overflow")
+
+        # number of sectors to clone: explicit flag wins, otherwise detect from SAK
+        max_sectors = args.maxSectors
+        if max_sectors is None:
+            max_sectors = detect_mf1_max_sectors(self.cmd)
+
+        # capacity of the target card in blocks
+        capacity = sum(
+            mf1_sector_block_range(s)[1] for s in range(max_sectors)
+        )
+        dump_blocks = len(buffer) // 16
+        if dump_blocks > capacity:
+            raise Exception(
+                f"Data block memory overflow: dump holds {dump_blocks} blocks,"
+                f" target card holds {capacity}"
+            )
+        if dump_blocks < capacity:
+            print(
+                f" {CR}[!]{C0}  Dump is partial ({dump_blocks} of {capacity} blocks),"
+                f" cloning what is available"
+            )
 
         # keys to use from file
-        keys = [bytes.fromhex(line[:-1]) for line in args.dic.readlines()]
+        keys = []
+        for line in args.dic.readlines():
+            line = line.strip()
+            if line:
+                keys.append(bytes.fromhex(line))
 
         # iterate over sectors
-        for s in range(16):
+        for s in range(max_sectors):
+            # 4K cards have 16-block sectors above sector 31
+            first_block, block_count = mf1_sector_block_range(s)
+            trailer_block = first_block + block_count - 1
+
+            # skip sectors that are not fully present in the dump
+            if trailer_block >= dump_blocks:
+                continue
+
             # try all keys for this sector
-            keyA, keyB = None, None
-            for key in keys:
-                # first try key B
-                try:
-                    self.cmd.mf1_read_one_block(4 * s, MfcKeyType.B, key)
-                    keyB = key
-                except UnexpectedResponseError:
-                    # ignore read errors at this stage as we want to try key A
-                    pass
-                # try with key A if B was unsuccessful
-                try:
-                    self.cmd.mf1_read_one_block(4 * s, MfcKeyType.A, key)
-                    keyA = key
-                except UnexpectedResponseError:
-                    pass
-                # both keys were found, no need to continue iterating
-                if keyA and keyB:
-                    break
+            type_a, key_a, type_b, key_b = find_mf1_sector_keys(
+                self.cmd, keys, first_block, block_count
+            )
             # neither A or B key was found
-            if not keyA and not keyB:
+            if type_a is None and type_b is None:
                 raise Exception(f"No key found for sector {s}")
+
             # iterate over blocks
-            for b in range(4):
-                block_data = buffer[(4 * s + b) * 16 : (4 * s + b + 1) * 16]
-                # special case for last block of each sector
-                if b == 3:
+            for b in range(block_count):
+                block_num = first_block + b
+                block_data = buffer[block_num * 16: (block_num + 1) * 16]
+                # special case for the trailer block of each sector
+                if b == block_count - 1:
                     # check ACL option
                     if not args.clone_access:
                         # if option is not specified, use generic ACL to be able to write again
                         block_data = (
                             block_data[:6] + bytes.fromhex("ff0780") + block_data[9:]
                         )
-                try:
-                    # try B key first
+                # try B key first, but never pass an unknown key
+                written = False
+                if key_b is not None:
+                    try:
+                        self.cmd.mf1_write_one_block(
+                            block_num, MfcKeyType.B, key_b, block_data
+                        )
+                        written = True
+                    except UnexpectedResponseError:
+                        pass
+                if not written:
+                    if key_a is None:
+                        raise Exception(f"No key found for sector {s}")
                     self.cmd.mf1_write_one_block(
-                        4 * s + b, MfcKeyType.B, keyB, block_data
+                        block_num, MfcKeyType.A, key_a, block_data
                     )
-                    continue
-                except UnexpectedResponseError:
-                    pass
-                self.cmd.mf1_write_one_block(4 * s + b, MfcKeyType.A, keyA, block_data)
-
-
 @hf_mf.command("value")
 class HFMFVALUE(ReaderRequiredUnit):
     def args_parser(self) -> ArgumentParserNoExit:
@@ -3918,7 +4156,7 @@ class HFMFELoad(SlotIndexArgsAndGoUnit, DeviceRequiredUnit):
         index = 0
         block = 0
         max_blocks = (self.device_com.data_max_length - 1) // 16
-        while index + 16 < len(buffer):
+        while index < len(buffer):
             # split a block from buffer
             block_data = buffer[index : index + 16 * max_blocks]
             n_blocks = len(block_data) // 16

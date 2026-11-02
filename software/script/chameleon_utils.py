@@ -142,6 +142,35 @@ def print_help(self):
     self.help_requested = True
 
 
+def mf1_sector_block_range(sector, blocks_per_sector=4):
+    """
+    Return (first_block, block_count) for a MIFARE Classic sector.
+
+    MIFARE Classic 4K has 40 sectors: sectors 0-31 hold 4 blocks each
+    (blocks 0-127), sectors 32-39 hold 16 blocks each (blocks 128-255).
+    Smaller cards only use sectors below 32, so they use 4 blocks each too.
+    """
+    if blocks_per_sector != 4:
+        return sector * blocks_per_sector, blocks_per_sector
+    if sector < 32:
+        return sector * 4, 4
+    return 128 + (sector - 32) * 16, 16
+
+
+def mf1_sector_of_block(block, blocks_per_sector=4):
+    """
+    Return the sector index a MIFARE Classic block belongs to.
+
+    Inverse of mf1_sector_block_range(): blocks 0-127 map to sectors 0-31,
+    blocks 128-255 map to sectors 32-39 on a 4K card.
+    """
+    if blocks_per_sector != 4:
+        return block // blocks_per_sector
+    if block < 128:
+        return block // 4
+    return 32 + (block - 128) // 16
+
+
 def print_mem_dump(bindata, blocksize, blocks_per_sector=4):
     hexadecimal_len = blocksize * 3 + 1
     ascii_len = blocksize + 1
@@ -152,17 +181,11 @@ def print_mem_dump(bindata, blocksize, blocks_per_sector=4):
     blocks = [bindata[i : i + blocksize] for i in range(0, len(bindata), blocksize)]
     blk_index = 0
     for b in blocks:
-        sec_index = blk_index // blocks_per_sector
-        if sec_index > 31:
-            blocks_per_sector = 16
-        sec_str = f"{sec_index:2}" if blk_index % blocks_per_sector == 0 else "  "
-        hexstr = " ".join(b.hex()[i : i + 2] for i in range(0, len(b.hex()), 2))
-        asciistr = "".join(
-            [
-                chr(b[i]) if (b[i] > 31 and b[i] < 127) else "."
-                for i in range(0, len(b), 1)
-            ]
-        )
+        sec_index = mf1_sector_of_block(blk_index, blocks_per_sector)
+        first_block, _ = mf1_sector_block_range(sec_index, blocks_per_sector)
+        sec_str = f"{sec_index:2}" if blk_index == first_block else "  "
+        hexstr = ' '.join(b.hex()[i:i+2] for i in range(0, len(b.hex()), 2))
+        asciistr = ''.join([chr(b[i]) if (b[i] > 31 and b[i] < 127) else '.' for i in range(0, len(b), 1)])
         print(f"[=]  {sec_str} | {blk_index:3} | {hexstr.upper()} | {asciistr} ")
         blk_index += 1
 
